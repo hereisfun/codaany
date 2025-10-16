@@ -529,3 +529,383 @@ const grid = window.coda?.documentModel?.session?.resolver?.typedGetters?.getGri
 - InlineCollaborativeObject：内联协作对象（按钮、公式、图片等）。
 - OT（Operational Transformation）：并发编辑冲突转换算法。
 
+
+---
+
+## 执行摘要与阅读指引
+
+本报告旨在以工程视角完整阐述 Coda 的前端技术实现：从架构分层、数据模型、协同机制（OT）、渲染与交互、公式与计算，到持久化、离线、性能、可观测性与安全策略，辅以 UML 类图、流程图与时序图，帮助开发者快速上手与深入调优。
+
+阅读建议：
+- 初学者：优先阅读“架构总览”“数据模型”“协同消息如何应用到 documentModel”。
+- 进阶读者：重点阅读“Slate 归一化规范”“OT 冲突案例”“渲染虚拟化与优化”“公式依赖图与调度”。
+- 调试/落地：参考“Chrome DevTools 调试指引”“最佳实践与反模式”“控制台脚本合集”。
+
+输出形式：所有图示采用 Mermaid，可直接在 Markdown 渲染器中预览；控制台脚本可在浏览器控制台直接执行。
+
+---
+
+## 数据层：模型与约束（Canvas / Slate / Grid / Table / Control / Blob）
+
+### 类图（核心）
+
+```mermaid
+classDiagram
+  direction LR
+  class DocumentModel {
+    +id: string
+    +pagesManager: PagesManager
+    +session: Session
+    +syncEngine: SyncEngine
+  }
+  class PagesManager {
+    +activePage: Page
+    +getById(id): Page
+    +getFlattenedPages(): Page[]
+    +getPageForCanvasId(id): Page
+  }
+  class Page { +id; +name; +icon; +canvas: Canvas }
+  class Canvas { +id; +slate: Slate; +getCanvasGrids(): Grid[] }
+  class Slate { +root: SlateRoot; +inNormalizationBatch(fn) }
+  class SlateRoot { +children: Block[]; +selection: Range }
+  class Block { <<abstract>> +type; +id; +children }
+  class Grid { +id; +name; +columns: Column[]; +rows: Row[]; +getDefaultView(): Table }
+  class Table { +id; +sourceObjectId; +layoutMode }
+  class Column { +id; +name; +type }
+  class Row { +id; +values: Map<columnId, any> }
+  class Control { +id; +controlType; +state }
+  class Blob { +id; +mime; +size; +altText }
+
+  DocumentModel --> PagesManager
+  PagesManager --> Page
+  Page --> Canvas
+  Canvas --> Slate
+  Slate --> SlateRoot
+  SlateRoot --> Block
+  Canvas --> Grid
+  Grid --> Column
+  Grid --> Row
+  Grid --> Table
+  DocumentModel --> Session
+  Session --> Resolver
+  Resolver --> TypedGetters
+```
+
+### Slate Block Tree 规范（精要）
+
+不变量：
+- 容器节点（如 CodeBlock、Table）仅接收特定子节点集合；
+- 行级节点（Paragraph、Heading、ListItem、CodeLine）只能作为容器的子节点或文档根直系子节点；
+- 内联节点（Text、InlineStructuredValue、InlineCollaborativeObject）只能出现在行级节点下；
+- 每次结构性编辑须放在 `slate.inNormalizationBatch` 内，批次完成时修复空行、非法嵌套、孤儿节点、选区越界。
+
+流程（归一化时序）：
+
+```mermaid
+flowchart TD
+  A[开始编辑批次] --> B[应用用户或协同操作]
+  B --> C{结构是否有效?}
+  C -- 否 --> D[修复空行/路径/嵌套]
+  D --> E[重建/校验选区]
+  C -- 是 --> E
+  E --> F[提交批次]
+  F --> G[触发渲染与依赖更新]
+```
+
+### IndexedDB / LocalStorage 设计（建议模型）
+
+建议以用途分库分 store，并前缀命名空间：
+- `idb_uncommitted`: 未提交操作日志（opId → payload/版本/时间戳）；
+- `idb_cache`: 热对象缓存（页面树、活动画布摘要、表格片段）；
+- `idb_blobs`: 二进制引用元信息（非二进制本体）；
+- `local_settings`: 轻量偏好/开关位/最近打开。
+
+键与容量：
+- 主键包含文档 id + 版本/时间片，便于迁移与清理；
+- 定期清理过期快照与历史操作（合并策略）。
+
+迁移：
+- 新版本引入 store/索引时采用版本升级回调；
+- 升级失败时回退至只读并提示复原。
+
+---
+
+## 协同层：Operation / 时序 / OT 转换 / 离线回放
+
+### Operation 数据结构（复述+扩展）
+
+```json
+{
+  "opId": "op-2b1d",
+  "version": 12346,
+  "appInstanceId": "client-xyz",
+  "type": "SLATE_INSERT_NODE",
+  "timestamp": 1710000000123,
+  "data": { "path": [2], "node": { "type": "paragraph", "id": "node-new", "children": [{ "text": "Hello" }] } }
+}
+```
+
+类别：
+- 文本/结构：`INSERT_TEXT`、`REMOVE_TEXT`、`SLATE_INSERT_NODE`、`SLATE_REMOVE_NODE`、`SET_NODE_ATTRS`...
+- 表格数据：`BULK_ADD_ROWS`、`BULK_MODIFY_ROW_VALUE`、`DELETE_ROWS`、`CHANGE_COLUMN_FORMAT`...
+- 对象与元数据：页面/控件/图片与权限、可见性等。
+
+### 协同时序（总览）
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant SE as SyncEngine
+  participant UL as UncommittedLog
+  participant S as Server
+  par 本地编辑
+    Client->>SE: createOp(op)
+    SE->>UL: append(op)
+    SE->>Client: optimistic apply
+    SE->>S: push(op)
+  and 远端回执/外来操作
+    S-->>SE: committed(op/ack)
+    SE->>UL: findByOpId
+    alt Self-ACK
+      UL-->>SE: hit
+      SE->>UL: remove
+      SE->>Client: finalize (no transform)
+    else Foreign-Op
+      UL-->>SE: miss
+      SE->>SE: transform against UL
+      SE->>Client: apply transformed op'
+    end
+  end
+```
+
+### OT 冲突案例（示例）
+
+1) 同一位置插入与删除：
+- 规则：删除先于插入，或将插入位置根据删除偏移调整；
+- 结果：两端观察到最终文本一致，顺序对齐。
+
+2) 表格同一单元格并发赋值：
+- 规则：基于版本时序，后写覆盖；必要时采用“最后写入赢 + 变更诊断”。
+
+### 离线与重连回放
+
+```mermaid
+flowchart LR
+  A[断网] --> B[操作进入 UncommittedLog]
+  B --> C[本地乐观应用]
+  C --> D[重连]
+  D --> E[按序回放本地操作]
+  E --> F{与远端版本存在缺口?}
+  F -- 是 --> G[拉取缺口并对齐]
+  F -- 否 --> H[完成对齐]
+```
+
+失败与补偿：对不可应用的操作回滚 UI，并提示用户；可重试错误采用指数退避，保留诊断上下文。
+
+---
+
+## 渲染层：Canvas/Slate 渲染、虚拟化与交互
+
+### 组件视图
+
+```mermaid
+graph LR
+  Input[User Input] --> Canvas
+  Canvas --> SlateEditor[Slate Editor]
+  SlateEditor --> DOM
+  Canvas --> Objects[Grids/Controls/Blobs]
+  Objects --> DOM
+  DOM --> Renderer
+  Renderer --> FrameLoop[Batch + rAF]
+```
+
+关键优化：
+- 子树命中重渲染（Path 精确对齐）；
+- 大文档/大表格窗口化（按视窗行/列窗口滑动）；
+- 批处理与帧合并（减少 layout thrashing）；
+- 可访问性：内联对象遵守 ARIA 规范，键盘导航与折叠状态一致。
+
+输入到渲染的时序：
+
+```mermaid
+sequenceDiagram
+  participant K as Keyboard
+  participant E as SlateEditor
+  participant N as Normalize
+  participant R as React Renderer
+  K->>E: keydown/insertText
+  E->>N: inNormalizationBatch(fn)
+  N-->>E: patched slate tree + selection
+  E->>R: setState(diff)
+  R-->>DOM: commit minimal subtree
+```
+
+---
+
+## 公式/计算：解析、依赖、调度与 Packs
+
+### 依赖图
+
+```mermaid
+graph LR
+  CellA[GridA:ColumnX] --> Formula1
+  ControlB --> Formula1
+  Formula1 --> GridC:ColumnY
+  GridC:ColumnY --> ViewC
+```
+
+要点：
+- 公式解析为 AST，绑定阶段记录正/反向依赖边；
+- 数据变更沿反向边传播“脏标记”，进入重算队列；
+- 调度：视区优先、交互优先、后台低优，避免卡顿；
+- Packs 在受控沙箱执行，错误以“值+诊断”形式返回并缓存。
+
+时序（失效与重算）：
+
+```mermaid
+sequenceDiagram
+  participant D as Data Change
+  participant G as DependencyGraph
+  participant Q as RecalcQueue
+  participant C as Calculator
+  participant R as Renderer
+  D->>G: markDirty(node)
+  G->>Q: enqueue(node, priority)
+  Q->>C: next()
+  C-->>Q: result/value or error
+  C->>R: setValue → render
+```
+
+---
+
+## 安全与权限（概要）
+
+- 保护模式：只读/建议/评论/完全控制；
+- 作用域：页面、列、视图与控件级别的可见/可编辑；
+- 内容安全：富文本渲染白名单；内联对象在受限容器中执行。
+
+---
+
+## 可观测性与调试
+
+指标建议：冷启动、订阅/回放时延、OT 转换耗时、渲染批次耗时、重算延迟、IDB 命中率、失败/重试次数。
+
+事件/Performance 标记（示例）：
+
+```js
+performance.getEntriesByType('mark').filter(e => /PageCanvasElementRendered/.test(e.name))
+```
+
+---
+
+## 性能与扩展性
+
+- 批处理：键入/粘贴/滚动/网络回写分批；
+- 节流与去抖：热路径减少多余重算与渲染；
+- 窗口化：长文档与大表格；
+- 内存治理：缓存上限与过期清理；
+- 避免热路径深拷贝与同步重算。
+
+---
+
+## 最佳实践与反模式
+
+建议：
+- Slate 结构性修改一律放入 `inNormalizationBatch`；
+- 表格数据增删改使用批量 API；
+- 协同失败可逆；
+- 公式调度以视区/交互优先。
+
+反模式：
+- 直接越层写底层存储；
+- 在热路径做大对象深比较；
+- 长事务阻塞 UI 线程。
+
+---
+
+## Chrome DevTools 调试指引（数据/公式/性能）
+
+### 1) 数据浏览与断言
+
+控制台常用：
+
+```js
+// 文档模型与当前画布
+const dm = window.coda?.documentModel;
+const page = dm?.pagesManager?.activePage;
+const canvas = page?.canvas;
+const root = canvas?.slate?.root;
+
+// 遍历所有段落/标题/表格占位
+for (const [node, path] of Slate.ib.filterNodesInDocument(root, Slate.ib.nodeIsContentBlockElement)) {
+  console.log(node.type, node.id, path);
+}
+
+// 枚举画布上的表格（Grid）与默认视图（Table）
+for (const g of canvas.getCanvasGrids?.() || []) {
+  const view = g.getDefaultView?.();
+  console.log('Grid', g.id, g.name, 'DefaultView', view?.id);
+}
+```
+
+### 2) 公式排查（依赖/值/错误）
+
+查找内联协作对象中的公式控件：
+
+```js
+const hits = [];
+for (const [n, p] of Slate.ib.filterNodesInDocument(root, Slate.ib.nodeIsInlineCollaborativeObject)) {
+  const m = dm.session.resolver.tryGetModel(n.id);
+  if (m?.getControlType && m.getControlType().controlType === 'Formula') {
+    const fv = m.getFormulaValue?.(); // { value, diagnostics }
+    hits.push({ id: n.id, path: p, value: fv?.value, diagnostics: fv?.diagnostics });
+  }
+}
+console.table(hits);
+```
+
+观察依赖失效与重算：
+
+```js
+// 数据变更后，收集最近的重算/错误
+performance.getEntriesByType('measure').filter(e => /Recalc|Formula/.test(e.name))
+```
+
+### 3) 协同消息与 WS
+
+- Network → WS → 选中文档通道，观察入站消息的 `type/opId/version`；
+- Console 监听关键函数：可在源代码中为 `applyCommittedOperation` 或 transform 位置添加断点（已 pretty-print）；
+- 对比本地 `UncommittedLog` 与入站 op 是否命中自确认路径。
+
+### 4) 渲染与性能
+
+- Performance 录制：关注渲染层 setState→commit 子树；
+- 观察标记：`PageCanvasElementRendered` 等标记是否延迟异常；
+- Elements → 找到 `[data-editable-id="<nodeId>"]` 检查节点结构与样式。
+
+### 5) 断点与源映射
+
+- 打开 Sources，勾选 Pretty print；
+- 通过搜索（⌘P）定位包含 “Slate”、“Canvas”、“SyncEngine” 的模块，设置断点；
+- Conditional breakpoint：仅在特定 `opId`/`gridId` 命中时暂停。
+
+---
+
+## 术语表与参考资料
+
+- Block Tree：基于 Slate 的富文本/对象混合树；
+- OT：并发冲突转换；
+- Self-ACK：自家操作的服务端确认；
+- Foreign-Op：他人操作；
+- Windowing：只渲染视窗附近节点；
+- Packs：外部计算/集成执行单元。
+
+---
+
+## 收尾与交叉校对
+
+- 图文一致性检查：类图/流程/时序与正文术语对齐；
+- 控制台脚本验证：在实际环境下逐条执行确认；
+- 性能与安全清单：在大文档与受限权限场景做抽样压测与回归。
+
+
